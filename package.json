@@ -1,0 +1,55 @@
+{
+  "name": "@dickwu/chunked-uploader-sdk",
+  "version": "1.0.0",
+  "description": "TypeScript SDK for chunked file uploads supporting large files (10GB+) with resumable uploads",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "upload",
+    "chunked",
+    "resumable",
+    "large-files",
+    "multipart",
+    "sdk",
+    "typescript",
+    "parallel-upload"
+  ],
+  "author": "dickwu",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dickwu/chunked-uploader-sdk-ts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dickwu/chunked-uploader-sdk-ts/issues"
+  },
+  "homepage": "https://github.com/dickwu/chunked-uploader-sdk-ts#readme",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
