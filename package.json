@@ -1,5 +1,5 @@
 {
-  "name": "@dickwu/chunked-uploader-sdk",
+  "name": "chunked-uploader-sdk",
   "version": "1.0.0",
   "description": "TypeScript SDK for chunked file uploads supporting large files (10GB+) with resumable uploads",
   "main": "dist/index.js",
