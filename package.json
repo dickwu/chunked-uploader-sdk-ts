@@ -30,9 +30,10 @@
     "multipart",
     "sdk",
     "typescript",
-    "parallel-upload"
+    "parallel-upload",
+    "cloudflare"
   ],
-  "author": "dickwu",
+  "author": "peilin wu",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -43,8 +44,9 @@
   },
   "homepage": "https://github.com/dickwu/chunked-uploader-sdk-ts#readme",
   "devDependencies": {
-    "@types/node": "^20.10.0",
+    "@types/node": "^22.10.0",
     "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.0"
   },
@@ -52,4 +54,3 @@
     "node": ">=18.0.0"
   }
 }
-
