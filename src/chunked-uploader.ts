@@ -54,7 +54,7 @@ export class ChunkedUploader {
     this.config = {
       ...DEFAULT_CONFIG,
       ...config,
-      fetch: config.fetch ?? globalThis.fetch,
+      fetch: config.fetch ?? globalThis.fetch.bind(globalThis),
     };
     this.fetchFn = this.config.fetch;
 
