@@ -69,10 +69,19 @@ export class ChunkedUploader {
   /**
    * Initialize a new upload session
    *
-   * @param filename - Original filename
+   * @param filename - Filename or path with filename (e.g., "video.mp4" or "videos/2024/december/video.mp4").
+   *                   When a path is included, the server will store the file at that path.
    * @param totalSize - Total file size in bytes
    * @param webhookUrl - Optional webhook URL for completion notification
    * @returns Upload session info with part tokens
+   *
+   * @example
+   * // Simple filename (stored at default location)
+   * await uploader.initUpload('large-video.mp4', fileSize);
+   *
+   * @example
+   * // With path (stored at videos/2024/december/)
+   * await uploader.initUpload('videos/2024/december/large-video.mp4', fileSize);
    */
   async initUpload(
     filename: string,

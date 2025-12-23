@@ -121,10 +121,17 @@ const result = await uploader.resumeUpload(uploadId, file, {
 
 Initialize an upload session manually.
 
+The `filename` parameter can include a path (e.g., `"videos/2024/december/large-video.mp4"`). When a path is included, the server will store the file at that path.
+
 ```typescript
+// Simple filename (stored at default location)
 const response = await uploader.initUpload('large-video.mp4', fileSize);
 console.log(`Upload ID: ${response.file_id}`);
 console.log(`Parts: ${response.total_parts}`);
+
+// With custom path (stored at videos/2024/december/)
+const response = await uploader.initUpload('videos/2024/december/large-video.mp4', fileSize);
+console.log(`File will be stored at: ${response.file_id}`);
 ```
 
 #### `uploadPart(uploadId, partNumber, token, data, signal?)`
@@ -200,6 +207,40 @@ input.addEventListener('change', async () => {
   const result = await uploader.uploadFile(file);
   console.log(result);
 });
+```
+
+### Upload to Custom Path
+
+For full control over the storage path, use `initUpload` with a path-prefixed filename:
+
+```typescript
+async function uploadToPath(file: File, targetPath: string) {
+  const uploader = new ChunkedUploader({
+    baseUrl: 'http://localhost:3000',
+    apiKey: 'your-api-key',
+  });
+
+  // Include path in filename (e.g., "videos/2024/december/my-video.mp4")
+  const remoteFilename = `${targetPath}/${file.name}`;
+  
+  // Initialize with custom path
+  const init = await uploader.initUpload(remoteFilename, file.size);
+  
+  // Upload using resumeUpload (handles parallel uploads)
+  const tokenMap = new Map(init.parts.map(p => [p.part, p.token]));
+  const result = await uploader.resumeUpload(init.file_id, file, {
+    partTokens: tokenMap,
+    onProgress: (event) => {
+      console.log(`Progress: ${event.overallProgress.toFixed(1)}%`);
+    },
+  });
+  
+  // Result: file stored at videos/2024/december/my-video.mp4
+  console.log('Final path:', result.finalPath);
+}
+
+// Usage
+uploadToPath(file, 'videos/2024/december');
 ```
 
 ### Upload with Progress UI
@@ -399,7 +440,9 @@ try {
 
 ## Server Requirements
 
-This SDK is designed to work with the Chunked Upload Server. The server provides:
+This SDK is designed to work with the [Chunked Upload Server](https://github.com/dickwu/chunked-uploader).
+
+**Server API Endpoints:**
 
 - `POST /upload/init` - Initialize upload (API Key auth)
 - `PUT /upload/{id}/part/{n}` - Upload chunk (JWT auth per part)
@@ -407,6 +450,10 @@ This SDK is designed to work with the Chunked Upload Server. The server provides
 - `POST /upload/{id}/complete` - Complete upload (API Key auth)
 - `DELETE /upload/{id}` - Cancel upload (API Key auth)
 - `GET /health` - Health check
+
+## Reference
+
+- **Server**: [chunked-uploader](https://github.com/dickwu/chunked-uploader) - A production-ready Rust HTTP server for resumable chunked uploads (10GB+) with support for local filesystem, SMB/NAS, and S3-compatible storage backends.
 
 ## License
 
