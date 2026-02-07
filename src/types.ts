@@ -14,6 +14,10 @@ export interface ChunkedUploaderConfig {
   retryAttempts?: number;
   /** Delay between retries in milliseconds (default: 1000) */
   retryDelay?: number;
+  /** Poll interval while waiting for finalization (default: 2000) */
+  finalizePollIntervalMs?: number;
+  /** Maximum wait for finalization before timing out (default: 7200000) */
+  finalizeTimeoutMs?: number;
   /** Custom fetch implementation (for Node.js or custom handling) */
   fetch?: typeof fetch;
 }
@@ -89,6 +93,11 @@ export interface PartStatus {
 }
 
 /**
+ * Upload phase
+ */
+export type UploadPhase = 'uploading' | 'finalizing' | 'complete' | 'failed';
+
+/**
  * Response from status check
  */
 export interface UploadStatusResponse {
@@ -98,16 +107,32 @@ export interface UploadStatusResponse {
   filename: string;
   /** Total file size in bytes */
   total_size: number;
+  /** Chunk size in bytes */
+  chunk_size: number;
   /** Total number of parts */
   total_parts: number;
   /** Number of parts uploaded */
   uploaded_parts: number;
-  /** Upload progress as percentage (0-100) */
-  progress_percent: number;
+  /** Upload stage progress percentage (0-100) */
+  upload_progress_percent: number;
+  /** Finalization progress percentage (0-100) */
+  finalizing_progress_percent: number;
   /** Overall upload status */
-  status: 'pending' | 'complete' | 'failed';
-  /** Array of part statuses */
-  parts: PartStatus[];
+  status: 'pending' | 'finalizing' | 'complete' | 'failed';
+  /** Current phase */
+  phase: UploadPhase;
+  /** Finalization error, if any */
+  finalization_error: string | null;
+  /** Storage backend */
+  storage_backend: 'local' | 's3' | 'smb';
+  /** Array of part statuses (present when include_parts=true) */
+  parts?: PartStatus[];
+  /** Final path when complete */
+  final_path?: string | null;
+  /** Upload creation time */
+  created_at?: string;
+  /** Upload expiration time */
+  expires_at?: string;
 }
 
 /**
@@ -121,11 +146,15 @@ export interface CompleteUploadResponse {
   /** Total file size in bytes */
   total_size: number;
   /** Upload status */
-  status: 'complete';
+  status: 'complete' | 'finalizing' | 'failed' | 'pending';
+  /** Current phase */
+  phase: UploadPhase;
+  /** Finalization progress percentage (0-100) */
+  finalizing_progress_percent: number;
   /** Final path to the assembled file */
-  final_path: string;
+  final_path?: string | null;
   /** Storage backend used */
-  storage_backend: 'local' | 's3';
+  storage_backend: 'local' | 's3' | 'smb';
 }
 
 /**
@@ -154,6 +183,8 @@ export interface HealthCheckResponse {
 export interface UploadProgressEvent {
   /** Upload identifier */
   fileId: string;
+  /** Current phase */
+  phase: UploadPhase;
   /** Current part being uploaded (0-indexed) */
   currentPart: number;
   /** Total number of parts */
@@ -164,7 +195,13 @@ export interface UploadProgressEvent {
   bytesUploaded: number;
   /** Total bytes of current part */
   bytesTotal: number;
-  /** Overall progress percentage (0-100) */
+  /** Current phase progress percentage (0-100) */
+  phaseProgress: number;
+  /** Upload phase progress percentage (0-100) */
+  uploadProgress: number;
+  /** Finalization phase progress percentage (0-100) */
+  finalizingProgress: number;
+  /** Aggregate progress percentage (0-100) */
   overallProgress: number;
 }
 
@@ -195,7 +232,7 @@ export interface UploadResult {
   /** Final path (after completion) */
   finalPath?: string;
   /** Storage backend */
-  storageBackend?: 'local' | 's3';
+  storageBackend?: 'local' | 's3' | 'smb';
   /** Whether the upload completed successfully */
   success: boolean;
   /** Error if failed */
@@ -269,4 +306,3 @@ export class ChunkedUploaderError extends Error {
     this.details = details;
   }
 }
-

@@ -35,11 +35,11 @@ export type {
   UploadResult,
   PartUploadResult,
   UploadProgressEvent,
+  UploadPhase,
 
   // Error types
   ApiErrorResponse,
 } from './types';
 
 export { ChunkedUploaderError } from './types';
-
 

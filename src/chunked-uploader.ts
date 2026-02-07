@@ -25,27 +25,17 @@ const DEFAULT_CONFIG = {
   concurrency: 3,
   retryAttempts: 3,
   retryDelay: 1000,
+  finalizePollIntervalMs: 2000,
+  finalizeTimeoutMs: 7200000,
 } as const;
 
-/**
- * ChunkedUploader SDK
- *
- * A TypeScript SDK for uploading large files (10GB+) to a chunked upload server.
- * Supports parallel uploads, resume capability, and progress tracking.
- *
- * @example
- * ```typescript
- * const uploader = new ChunkedUploader({
- *   baseUrl: 'https://upload.example.com',
- *   apiKey: 'your-api-key',
- * });
- *
- * // Upload a file
- * const result = await uploader.uploadFile(file, {
- *   onProgress: (event) => console.log(`${event.overallProgress}%`),
- * });
- * ```
- */
+interface CompleteUploadOptions {
+  onProgress?: (event: UploadProgressEvent) => void;
+  signal?: AbortSignal;
+  totalParts?: number;
+  uploadedParts?: number;
+}
+
 export class ChunkedUploader {
   private readonly config: Required<ChunkedUploaderConfig>;
   private readonly fetchFn: typeof fetch;
@@ -66,23 +56,6 @@ export class ChunkedUploader {
     }
   }
 
-  /**
-   * Initialize a new upload session
-   *
-   * @param filename - Filename or path with filename (e.g., "video.mp4" or "videos/2024/december/video.mp4").
-   *                   When a path is included, the server will store the file at that path.
-   * @param totalSize - Total file size in bytes
-   * @param webhookUrl - Optional webhook URL for completion notification
-   * @returns Upload session info with part tokens
-   *
-   * @example
-   * // Simple filename (stored at default location)
-   * await uploader.initUpload('large-video.mp4', fileSize);
-   *
-   * @example
-   * // With path (stored at videos/2024/december/)
-   * await uploader.initUpload('videos/2024/december/large-video.mp4', fileSize);
-   */
   async initUpload(
     filename: string,
     totalSize: number,
@@ -94,26 +67,11 @@ export class ChunkedUploader {
       ...(webhookUrl && { webhook_url: webhookUrl }),
     };
 
-    const response = await this.request<InitUploadResponse>(
-      'POST',
-      '/upload/init',
-      payload,
-      { useApiKey: true }
-    );
-
-    return response;
+    return this.request<InitUploadResponse>('POST', '/upload/init', payload, {
+      useApiKey: true,
+    });
   }
 
-  /**
-   * Upload a single part/chunk
-   *
-   * @param uploadId - Upload session ID
-   * @param partNumber - Part number (0-indexed)
-   * @param token - JWT token for this part
-   * @param data - Chunk data to upload
-   * @param signal - Optional AbortSignal for cancellation
-   * @returns Part upload result
-   */
   async uploadPart(
     uploadId: string,
     partNumber: number,
@@ -122,14 +80,12 @@ export class ChunkedUploader {
     signal?: AbortSignal
   ): Promise<UploadPartResponse> {
     const url = `${this.config.baseUrl}/upload/${uploadId}/part/${partNumber}`;
-
-    // Convert to Blob for universal fetch compatibility
     const body = this.toBlob(data);
 
     const response = await this.fetchFn(url, {
       method: 'PUT',
       headers: {
-        'Authorization': `Bearer ${token}`,
+        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/octet-stream',
       },
       body,
@@ -148,42 +104,52 @@ export class ChunkedUploader {
     return response.json();
   }
 
-  /**
-   * Get upload status and progress
-   *
-   * @param uploadId - Upload session ID
-   * @returns Upload status with part details
-   */
-  async getStatus(uploadId: string): Promise<UploadStatusResponse> {
-    return this.request<UploadStatusResponse>(
-      'GET',
-      `/upload/${uploadId}/status`,
-      undefined,
-      { useApiKey: true }
-    );
+  async getStatus(
+    uploadId: string,
+    options: { includeParts?: boolean; signal?: AbortSignal } = {}
+  ): Promise<UploadStatusResponse> {
+    const params = new URLSearchParams();
+    if (options.includeParts) {
+      params.set('include_parts', 'true');
+    }
+    const query = params.toString();
+    const path = `/upload/${uploadId}/status${query ? `?${query}` : ''}`;
+
+    return this.request<UploadStatusResponse>('GET', path, undefined, {
+      useApiKey: true,
+      signal: options.signal,
+    });
   }
 
-  /**
-   * Complete an upload (assemble all parts)
-   *
-   * @param uploadId - Upload session ID
-   * @returns Completion result with final file path
-   */
-  async completeUpload(uploadId: string): Promise<CompleteUploadResponse> {
-    return this.request<CompleteUploadResponse>(
+  async completeUpload(
+    uploadId: string,
+    options: CompleteUploadOptions = {}
+  ): Promise<CompleteUploadResponse> {
+    const initial = await this.request<CompleteUploadResponse>(
       'POST',
       `/upload/${uploadId}/complete`,
       undefined,
-      { useApiKey: true }
+      { useApiKey: true, signal: options.signal }
     );
+
+    if (initial.status === 'complete') {
+      options.onProgress?.(
+        this.buildProgressEvent({
+          fileId: uploadId,
+          phase: 'complete',
+          phaseProgress: 100,
+          uploadProgress: 100,
+          finalizingProgress: 100,
+          totalParts: options.totalParts ?? 0,
+          uploadedParts: options.uploadedParts ?? options.totalParts ?? 0,
+        })
+      );
+      return initial;
+    }
+
+    return this.waitForCompletion(uploadId, options);
   }
 
-  /**
-   * Cancel an upload and cleanup
-   *
-   * @param uploadId - Upload session ID
-   * @returns Cancellation confirmation
-   */
   async cancelUpload(uploadId: string): Promise<CancelUploadResponse> {
     return this.request<CancelUploadResponse>(
       'DELETE',
@@ -193,60 +159,63 @@ export class ChunkedUploader {
     );
   }
 
-  /**
-   * Health check endpoint
-   *
-   * @returns Server health status
-   */
   async healthCheck(): Promise<HealthCheckResponse> {
     return this.request<HealthCheckResponse>('GET', '/health');
   }
 
-  /**
-   * Upload a file with automatic chunking, parallel uploads, and progress tracking
-   *
-   * @param file - File to upload (File, Blob, or ArrayBuffer)
-   * @param options - Upload options
-   * @returns Upload result
-   */
-  async uploadFile(
-    file: FileSource,
-    options: UploadOptions = {}
-  ): Promise<UploadResult> {
-    const { webhookUrl, onProgress, onPartComplete, onPartError, signal, concurrency } = options;
+  async uploadFile(file: FileSource, options: UploadOptions = {}): Promise<UploadResult> {
+    const {
+      webhookUrl,
+      onProgress,
+      onPartComplete,
+      onPartError,
+      signal,
+      concurrency,
+    } = options;
 
-    // Get file info with streaming support
     const { filename, size, getChunk } = this.normalizeFileSourceStreaming(file);
-
-    // Initialize upload
     const initResponse = await this.initUpload(filename, size, webhookUrl);
     const { file_id, parts, chunk_size } = initResponse;
 
     try {
-      // Create part token map
       const partTokens = new Map<number, string>();
       for (const part of parts) {
         partTokens.set(part.part, part.token);
       }
 
-      // Upload all parts in parallel
-      await this.uploadPartsParallel(
-        file_id,
-        getChunk,
-        size,
-        chunk_size,
-        partTokens,
-        {
-          onProgress,
-          onPartComplete,
-          onPartError,
-          signal,
-          concurrency: concurrency ?? this.config.concurrency,
-        }
+      await this.uploadPartsParallel(file_id, getChunk, size, chunk_size, partTokens, {
+        onProgress,
+        onPartComplete,
+        onPartError,
+        signal,
+        concurrency: concurrency ?? this.config.concurrency,
+      });
+
+      const totalParts = Math.ceil(size / chunk_size);
+      onProgress?.(
+        this.buildProgressEvent({
+          fileId: file_id,
+          phase: 'finalizing',
+          phaseProgress: 0,
+          uploadProgress: 100,
+          finalizingProgress: 0,
+          totalParts,
+          uploadedParts: totalParts,
+        })
       );
 
-      // Complete upload
-      const completeResponse = await this.completeUpload(file_id);
+      const completeResponse = await this.completeUpload(file_id, {
+        onProgress,
+        signal,
+        totalParts,
+        uploadedParts: totalParts,
+      });
+
+      if (completeResponse.status !== 'complete' || !completeResponse.final_path) {
+        throw new ChunkedUploaderError(
+          `Upload did not complete successfully (status=${completeResponse.status})`
+        );
+      }
 
       return {
         fileId: file_id,
@@ -267,51 +236,59 @@ export class ChunkedUploader {
     }
   }
 
-  /**
-   * Resume an interrupted upload
-   *
-   * @param uploadId - Upload session ID to resume
-   * @param file - File to upload (must match original file)
-   * @param options - Resume options
-   * @returns Upload result
-   */
   async resumeUpload(
     uploadId: string,
     file: FileSource,
     options: ResumeOptions = {}
   ): Promise<UploadResult> {
-    const { partTokens, onProgress, onPartComplete, onPartError, signal, concurrency } = options;
+    const {
+      partTokens,
+      onProgress,
+      onPartComplete,
+      onPartError,
+      signal,
+      concurrency,
+    } = options;
 
-    // Get current status
-    const status = await this.getStatus(uploadId);
+    const status = await this.getStatus(uploadId, { includeParts: true, signal });
 
     if (status.status === 'complete') {
       return {
         fileId: uploadId,
         filename: status.filename,
         totalSize: status.total_size,
+        finalPath: status.final_path ?? undefined,
+        storageBackend: status.storage_backend,
         success: true,
       };
     }
 
-    // Get file info with streaming support
     const { filename, size, getChunk } = this.normalizeFileSourceStreaming(file);
 
-    // Verify file matches
     if (size !== status.total_size) {
       throw new ChunkedUploaderError(
         `File size mismatch: expected ${status.total_size}, got ${size}`
       );
     }
 
-    // Get pending parts
-    const pendingParts = status.parts
+    const pendingParts = (status.parts ?? [])
       .filter((p) => p.status === 'pending')
       .map((p) => p.part);
 
     if (pendingParts.length === 0) {
-      // All parts uploaded, just complete
-      const completeResponse = await this.completeUpload(uploadId);
+      const completeResponse = await this.completeUpload(uploadId, {
+        onProgress,
+        signal,
+        totalParts: status.total_parts,
+        uploadedParts: status.uploaded_parts,
+      });
+
+      if (completeResponse.status !== 'complete' || !completeResponse.final_path) {
+        throw new ChunkedUploaderError(
+          `Upload did not complete successfully (status=${completeResponse.status})`
+        );
+      }
+
       return {
         fileId: uploadId,
         filename: status.filename,
@@ -322,37 +299,49 @@ export class ChunkedUploader {
       };
     }
 
-    // We need tokens for pending parts
     if (!partTokens || partTokens.size === 0) {
       throw new ChunkedUploaderError(
         'Part tokens required for resume. Store tokens from initial upload or re-initialize.'
       );
     }
 
-    // Calculate chunk size from total size and parts
-    const chunkSize = Math.ceil(status.total_size / status.total_parts);
+    const chunkSize = status.chunk_size || Math.ceil(status.total_size / status.total_parts);
 
     try {
-      // Upload pending parts only in parallel
-      await this.uploadPartsParallel(
-        uploadId,
-        getChunk,
-        size,
-        chunkSize,
-        partTokens,
-        {
-          onProgress,
-          onPartComplete,
-          onPartError,
-          signal,
-          concurrency: concurrency ?? this.config.concurrency,
-          pendingParts: new Set(pendingParts),
-          uploadedCount: status.uploaded_parts,
-        }
+      await this.uploadPartsParallel(uploadId, getChunk, size, chunkSize, partTokens, {
+        onProgress,
+        onPartComplete,
+        onPartError,
+        signal,
+        concurrency: concurrency ?? this.config.concurrency,
+        pendingParts: new Set(pendingParts),
+        uploadedCount: status.uploaded_parts,
+      });
+
+      onProgress?.(
+        this.buildProgressEvent({
+          fileId: uploadId,
+          phase: 'finalizing',
+          phaseProgress: 0,
+          uploadProgress: 100,
+          finalizingProgress: 0,
+          totalParts: status.total_parts,
+          uploadedParts: status.total_parts,
+        })
       );
 
-      // Complete upload
-      const completeResponse = await this.completeUpload(uploadId);
+      const completeResponse = await this.completeUpload(uploadId, {
+        onProgress,
+        signal,
+        totalParts: status.total_parts,
+        uploadedParts: status.total_parts,
+      });
+
+      if (completeResponse.status !== 'complete' || !completeResponse.final_path) {
+        throw new ChunkedUploaderError(
+          `Upload did not complete successfully (status=${completeResponse.status})`
+        );
+      }
 
       return {
         fileId: uploadId,
@@ -373,12 +362,6 @@ export class ChunkedUploader {
     }
   }
 
-  /**
-   * Upload multiple parts in parallel with streaming chunk reads
-   * 
-   * This method reads chunks on-demand (streaming) to avoid loading the entire
-   * file into memory, and uses a worker pool pattern for efficient parallel uploads.
-   */
   private async uploadPartsParallel(
     uploadId: string,
     getChunk: (partNumber: number, chunkSize: number) => Promise<Blob>,
@@ -405,10 +388,8 @@ export class ChunkedUploader {
       uploadedCount = 0,
     } = options;
 
-    // Calculate total parts
     const totalParts = Math.ceil(totalSize / chunkSize);
 
-    // Determine which parts to upload
     const partsToUpload: number[] = [];
     for (let i = 0; i < totalParts; i++) {
       if (!pendingParts || pendingParts.has(i)) {
@@ -417,16 +398,9 @@ export class ChunkedUploader {
     }
 
     let uploadedParts = uploadedCount;
-    let bytesUploaded = uploadedCount * chunkSize;
     const errors: Array<{ partNumber: number; error: Error }> = [];
-    const activeUploads = new Map<number, Promise<void>>();
-
-    // Create a queue of parts to upload
     const queue = [...partsToUpload];
 
-    /**
-     * Upload a single part with streaming chunk read
-     */
     const uploadSinglePart = async (partNumber: number): Promise<void> => {
       const token = partTokens.get(partNumber);
       if (!token) {
@@ -438,20 +412,14 @@ export class ChunkedUploader {
 
       for (let attempt = 1; attempt <= this.config.retryAttempts; attempt++) {
         try {
-          // Check for abort before each attempt
           if (signal?.aborted) {
             throw new ChunkedUploaderError('Upload aborted');
           }
 
-          // Read chunk on-demand (streaming)
           const chunk = await getChunk(partNumber, chunkSize);
-          
-          // Upload the chunk
           const response = await this.uploadPart(uploadId, partNumber, token, chunk, signal);
 
-          // Success
           uploadedParts++;
-          bytesUploaded += partSize;
 
           const result: PartUploadResult = {
             partNumber,
@@ -459,21 +427,27 @@ export class ChunkedUploader {
             response,
           };
           onPartComplete?.(result);
-          onProgress?.({
-            fileId: uploadId,
-            currentPart: partNumber,
-            totalParts,
-            uploadedParts,
-            bytesUploaded: partSize,
-            bytesTotal: partSize,
-            overallProgress: (uploadedParts / totalParts) * 100,
-          });
+
+          const uploadProgress = (uploadedParts / totalParts) * 100;
+          onProgress?.(
+            this.buildProgressEvent({
+              fileId: uploadId,
+              phase: 'uploading',
+              phaseProgress: uploadProgress,
+              uploadProgress,
+              finalizingProgress: 0,
+              totalParts,
+              uploadedParts,
+              currentPart: partNumber,
+              bytesUploaded: partSize,
+              bytesTotal: partSize,
+            })
+          );
 
           return;
         } catch (error) {
           lastError = error instanceof Error ? error : new Error(String(error));
-          
-          // Don't retry on abort
+
           if (signal?.aborted) {
             throw lastError;
           }
@@ -486,7 +460,6 @@ export class ChunkedUploader {
         }
       }
 
-      // All retries exhausted
       const result: PartUploadResult = {
         partNumber,
         success: false,
@@ -496,16 +469,11 @@ export class ChunkedUploader {
       errors.push({ partNumber, error: lastError! });
     };
 
-    /**
-     * Worker pool: Process queue with N concurrent workers
-     */
     const runWorkerPool = async (): Promise<void> => {
       const workers: Promise<void>[] = [];
 
-      // Create worker function
       const worker = async (): Promise<void> => {
         while (queue.length > 0) {
-          // Check for abort
           if (signal?.aborted) {
             return;
           }
@@ -515,76 +483,157 @@ export class ChunkedUploader {
             return;
           }
 
-          const uploadPromise = uploadSinglePart(partNumber);
-          activeUploads.set(partNumber, uploadPromise);
-
-          try {
-            await uploadPromise;
-          } finally {
-            activeUploads.delete(partNumber);
-          }
+          await uploadSinglePart(partNumber);
         }
       };
 
-      // Start N workers
       for (let i = 0; i < concurrency; i++) {
         workers.push(worker());
       }
 
-      // Wait for all workers to complete
       await Promise.all(workers);
     };
 
-    // Execute the worker pool
     await runWorkerPool();
 
-    // Check for abort
     if (signal?.aborted) {
       throw new ChunkedUploaderError('Upload aborted');
     }
 
-    // Check for errors
     if (errors.length > 0) {
-      const failedParts = errors.map(e => e.partNumber).join(', ');
+      const failedParts = errors.map((e) => e.partNumber).join(', ');
       throw new ChunkedUploaderError(
         `Upload failed: ${errors.length} part(s) failed [${failedParts}]. First error: ${errors[0].error.message}`
       );
     }
   }
 
-  /**
-   * Calculate the size of a specific part
-   */
+  private async waitForCompletion(
+    uploadId: string,
+    options: CompleteUploadOptions
+  ): Promise<CompleteUploadResponse> {
+    const startedAt = Date.now();
+
+    while (true) {
+      if (options.signal?.aborted) {
+        throw new ChunkedUploaderError('Upload aborted');
+      }
+
+      if (Date.now() - startedAt > this.config.finalizeTimeoutMs) {
+        throw new ChunkedUploaderError(
+          `Finalization timed out after ${this.config.finalizeTimeoutMs}ms`
+        );
+      }
+
+      const status = await this.getStatus(uploadId, {
+        includeParts: false,
+        signal: options.signal,
+      });
+
+      const totalParts = options.totalParts ?? status.total_parts;
+      const uploadedParts = options.uploadedParts ?? status.uploaded_parts;
+
+      if (status.status === 'complete') {
+        options.onProgress?.(
+          this.buildProgressEvent({
+            fileId: uploadId,
+            phase: 'complete',
+            phaseProgress: 100,
+            uploadProgress: 100,
+            finalizingProgress: 100,
+            totalParts,
+            uploadedParts,
+          })
+        );
+
+        return {
+          file_id: status.file_id,
+          filename: status.filename,
+          total_size: status.total_size,
+          status: 'complete',
+          phase: 'complete',
+          finalizing_progress_percent: 100,
+          final_path: status.final_path ?? null,
+          storage_backend: status.storage_backend,
+        };
+      }
+
+      if (status.status === 'failed') {
+        throw new ChunkedUploaderError(
+          status.finalization_error || 'Upload finalization failed'
+        );
+      }
+
+      const finalizingProgress = Math.max(0, status.finalizing_progress_percent || 0);
+      options.onProgress?.(
+        this.buildProgressEvent({
+          fileId: uploadId,
+          phase: 'finalizing',
+          phaseProgress: finalizingProgress,
+          uploadProgress: 100,
+          finalizingProgress,
+          totalParts,
+          uploadedParts,
+        })
+      );
+
+      await this.delayWithSignal(this.config.finalizePollIntervalMs, options.signal);
+    }
+  }
+
+  private buildProgressEvent(params: {
+    fileId: string;
+    phase: UploadProgressEvent['phase'];
+    phaseProgress: number;
+    uploadProgress: number;
+    finalizingProgress: number;
+    totalParts: number;
+    uploadedParts: number;
+    currentPart?: number;
+    bytesUploaded?: number;
+    bytesTotal?: number;
+  }): UploadProgressEvent {
+    return {
+      fileId: params.fileId,
+      phase: params.phase,
+      currentPart: params.currentPart ?? 0,
+      totalParts: params.totalParts,
+      uploadedParts: params.uploadedParts,
+      bytesUploaded: params.bytesUploaded ?? 0,
+      bytesTotal: params.bytesTotal ?? 0,
+      phaseProgress: Math.max(0, Math.min(100, params.phaseProgress)),
+      uploadProgress: Math.max(0, Math.min(100, params.uploadProgress)),
+      finalizingProgress: Math.max(0, Math.min(100, params.finalizingProgress)),
+      overallProgress:
+        params.phase === 'uploading'
+          ? Math.max(0, Math.min(100, params.uploadProgress))
+          : 100,
+    };
+  }
+
   private getPartSize(partNumber: number, chunkSize: number, totalSize: number): number {
     const start = partNumber * chunkSize;
     return Math.min(chunkSize, totalSize - start);
   }
 
-  /**
-   * Normalize different file source types with streaming support
-   * 
-   * Returns a getChunk function that reads chunks on-demand, avoiding
-   * loading the entire file into memory for large files.
-   */
   private normalizeFileSourceStreaming(source: FileSource): {
     filename: string;
     size: number;
     getChunk: (partNumber: number, chunkSize: number) => Promise<Blob>;
   } {
-    if (source instanceof File) {
+    if (typeof File !== 'undefined' && source instanceof File) {
       return {
         filename: source.name,
         size: source.size,
         getChunk: (partNumber, chunkSize) => {
           const start = partNumber * chunkSize;
           const end = Math.min(start + chunkSize, source.size);
-          // File.slice() is synchronous and doesn't load data into memory
           return Promise.resolve(source.slice(start, end));
         },
       };
     }
 
-    if (source instanceof Blob) {
+    if (typeof Blob !== 'undefined' && source instanceof Blob) {
       return {
         filename: 'blob',
         size: source.size,
@@ -609,7 +658,6 @@ export class ChunkedUploader {
       };
     }
 
-    // Buffer (Node.js)
     if (Buffer.isBuffer(source)) {
       return {
         filename: 'file',
@@ -617,11 +665,11 @@ export class ChunkedUploader {
         getChunk: (partNumber, chunkSize) => {
           const start = partNumber * chunkSize;
           const end = Math.min(start + chunkSize, source.byteLength);
-          // Create a view into the buffer without copying
           const chunk = source.subarray(start, end);
-          // Convert to Blob
           const copy = new ArrayBuffer(chunk.byteLength);
-          new Uint8Array(copy).set(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+          new Uint8Array(copy).set(
+            new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+          );
           return Promise.resolve(new Blob([copy]));
         },
       };
@@ -630,14 +678,11 @@ export class ChunkedUploader {
     throw new ChunkedUploaderError('Unsupported file source type');
   }
 
-  /**
-   * Make an HTTP request
-   */
   private async request<T>(
     method: string,
     path: string,
     body?: unknown,
-    options: { useApiKey?: boolean } = {}
+    options: { useApiKey?: boolean; signal?: AbortSignal; timeoutMs?: number } = {}
   ): Promise<T> {
     const url = `${this.config.baseUrl}${path}`;
     const headers: Record<string, string> = {};
@@ -651,7 +696,11 @@ export class ChunkedUploader {
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.config.timeout);
+    const timeoutMs = options.timeoutMs ?? this.config.timeout;
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    const abortListener = () => controller.abort();
+    options.signal?.addEventListener('abort', abortListener, { once: true });
 
     try {
       const response = await this.fetchFn(url, {
@@ -674,12 +723,10 @@ export class ChunkedUploader {
       return response.json();
     } finally {
       clearTimeout(timeoutId);
+      options.signal?.removeEventListener('abort', abortListener);
     }
   }
 
-  /**
-   * Parse error response body
-   */
   private async parseErrorResponse(
     response: Response
   ): Promise<{ error?: string; code?: string; details?: unknown }> {
@@ -690,33 +737,50 @@ export class ChunkedUploader {
     }
   }
 
-  /**
-   * Delay utility
-   */
   private delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  /**
-   * Convert various data types to Blob for fetch compatibility
-   */
+  private delayWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new ChunkedUploaderError('Upload aborted'));
+        return;
+      }
+
+      const timeoutId = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+
+      const onAbort = () => {
+        clearTimeout(timeoutId);
+        signal?.removeEventListener('abort', onAbort);
+        reject(new ChunkedUploaderError('Upload aborted'));
+      };
+
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
   private toBlob(data: Blob | ArrayBuffer | Buffer): Blob {
-    if (data instanceof Blob) {
+    if (typeof Blob !== 'undefined' && data instanceof Blob) {
       return data;
     }
 
     if (Buffer.isBuffer(data)) {
-      // Create a copy to ensure we have a proper ArrayBuffer (not SharedArrayBuffer)
       const copy = new ArrayBuffer(data.byteLength);
       const view = new Uint8Array(copy);
       view.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
       return new Blob([copy]);
     }
 
-    // ArrayBuffer - may be SharedArrayBuffer, so copy to be safe
-    const copy = new ArrayBuffer(data.byteLength);
-    new Uint8Array(copy).set(new Uint8Array(data));
-    return new Blob([copy]);
+    if (data instanceof ArrayBuffer) {
+      const copy = new ArrayBuffer(data.byteLength);
+      new Uint8Array(copy).set(new Uint8Array(data));
+      return new Blob([copy]);
+    }
+
+    throw new ChunkedUploaderError('Unsupported binary data type');
   }
 }
-

@@ -27,4 +27,6 @@ coverage/
 
 tests
 
+*.tgz
+
 

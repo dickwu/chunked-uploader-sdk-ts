@@ -1,6 +1,6 @@
 # Chunked Uploader SDK
 
-A TypeScript SDK for uploading large files (10GB+) to a chunked upload server. Supports parallel uploads, resume capability, and progress tracking.
+A TypeScript SDK for uploading large files (10GB+) to a chunked upload server. Supports parallel uploads, resume capability, and phase-aware progress tracking.
 
 ## Features
 
@@ -8,7 +8,7 @@ A TypeScript SDK for uploading large files (10GB+) to a chunked upload server. S
 - **Automatic Chunking**: Files split into 50MB chunks (Cloudflare compatible)
 - **Parallel Uploads**: Configurable concurrency for faster uploads
 - **Resumable**: Continue interrupted uploads from where they left off
-- **Progress Tracking**: Real-time progress callbacks
+- **Phase Progress Tracking**: `uploading -> finalizing -> complete`
 - **Retry Logic**: Automatic retry for failed chunks
 - **TypeScript**: Full type definitions included
 - **Isomorphic**: Works in both browser and Node.js
@@ -18,6 +18,17 @@ A TypeScript SDK for uploading large files (10GB+) to a chunked upload server. S
 ```bash
 npm install chunked-uploader-sdk
 ```
+
+## v2.0.0 Breaking Changes
+
+- `POST /upload/{id}/complete` is now async (`202` while finalizing, `200` when complete).
+- `getStatus()` now returns phase and split progress:
+  - `phase`
+  - `upload_progress_percent`
+  - `finalizing_progress_percent`
+  - `finalization_error`
+- `onProgress` now includes phase-aware fields:
+  - `phase`, `phaseProgress`, `uploadProgress`, `finalizingProgress`
 
 ## Quick Start
 
@@ -66,6 +77,12 @@ interface ChunkedUploaderConfig {
 
   /** Delay between retries in milliseconds (default: 1000) */
   retryDelay?: number;
+
+  /** Poll interval while waiting for finalization (default: 2000) */
+  finalizePollIntervalMs?: number;
+
+  /** Finalization timeout in milliseconds (default: 7200000 / 2h) */
+  finalizeTimeoutMs?: number;
 
   /** Custom fetch implementation */
   fetch?: typeof fetch;
@@ -147,25 +164,31 @@ const result = await uploader.uploadPart(
 );
 ```
 
-#### `getStatus(uploadId)`
+#### `getStatus(uploadId, options?)`
 
 Get upload progress and status.
 
 ```typescript
-const status = await uploader.getStatus(uploadId);
-console.log(`Progress: ${status.progress_percent}%`);
+const status = await uploader.getStatus(uploadId, { includeParts: true });
+console.log(`Phase: ${status.phase}`);
+console.log(`Upload: ${status.upload_progress_percent}%`);
+console.log(`Finalizing: ${status.finalizing_progress_percent}%`);
 console.log(`Uploaded: ${status.uploaded_parts}/${status.total_parts}`);
 
 // Find pending parts
-const pending = status.parts.filter(p => p.status === 'pending');
+const pending = (status.parts ?? []).filter(p => p.status === 'pending');
 ```
 
 #### `completeUpload(uploadId)`
 
-Complete an upload (assemble all parts).
+Trigger finalization and wait until the upload reaches a terminal state.
+
+The SDK handles async server completion (`202 Accepted`) by polling `GET /upload/{id}/status`.
 
 ```typescript
 const result = await uploader.completeUpload(uploadId);
+console.log(`Status: ${result.status}`);
+console.log(`Finalizing: ${result.finalizing_progress_percent}%`);
 console.log(`File path: ${result.final_path}`);
 ```
 
@@ -251,8 +274,13 @@ const statusText = document.querySelector('.status') as HTMLElement;
 
 const result = await uploader.uploadFile(file, {
   onProgress: (event) => {
-    progressBar.style.width = `${event.overallProgress}%`;
-    statusText.textContent = `Uploading part ${event.uploadedParts}/${event.totalParts}`;
+    progressBar.style.width = `${event.phaseProgress}%`;
+    statusText.textContent =
+      event.phase === 'uploading'
+        ? `Uploading ${event.uploadProgress.toFixed(0)}%`
+        : event.phase === 'finalizing'
+          ? `Finalizing ${event.finalizingProgress.toFixed(0)}%`
+          : 'Complete';
   },
   onPartComplete: (result) => {
     if (!result.success) {
@@ -446,8 +474,8 @@ This SDK is designed to work with the [Chunked Upload Server](https://github.com
 
 - `POST /upload/init` - Initialize upload (API Key auth)
 - `PUT /upload/{id}/part/{n}` - Upload chunk (JWT auth per part)
-- `GET /upload/{id}/status` - Get progress (API Key auth)
-- `POST /upload/{id}/complete` - Complete upload (API Key auth)
+- `GET /upload/{id}/status` - Get upload/finalization phase progress (API Key auth)
+- `POST /upload/{id}/complete` - Start or check completion (API Key auth)
 - `DELETE /upload/{id}` - Cancel upload (API Key auth)
 - `GET /health` - Health check
 
@@ -458,4 +486,3 @@ This SDK is designed to work with the [Chunked Upload Server](https://github.com
 ## License
 
 MIT
-
