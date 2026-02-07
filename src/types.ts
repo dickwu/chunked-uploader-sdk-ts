@@ -18,6 +18,8 @@ export interface ChunkedUploaderConfig {
   finalizePollIntervalMs?: number;
   /** Maximum wait for finalization before timing out (default: 7200000) */
   finalizeTimeoutMs?: number;
+  /** Timeout per individual part upload in milliseconds (default: 300000 = 5 minutes) */
+  partUploadTimeoutMs?: number;
   /** Custom fetch implementation (for Node.js or custom handling) */
   fetch?: typeof fetch;
 }

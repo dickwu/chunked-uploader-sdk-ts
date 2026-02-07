@@ -27,6 +27,7 @@ const DEFAULT_CONFIG = {
   retryDelay: 1000,
   finalizePollIntervalMs: 2000,
   finalizeTimeoutMs: 7200000,
+  partUploadTimeoutMs: 300000,
 } as const;
 
 interface CompleteUploadOptions {
@@ -82,26 +83,49 @@ export class ChunkedUploader {
     const url = `${this.config.baseUrl}/upload/${uploadId}/part/${partNumber}`;
     const body = this.toBlob(data);
 
-    const response = await this.fetchFn(url, {
-      method: 'PUT',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/octet-stream',
-      },
-      body,
-      signal,
-    });
+    // Per-part timeout: 5 minutes per part (large chunks over slow connections need time)
+    const partTimeoutMs = this.config.partUploadTimeoutMs ?? 300000;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), partTimeoutMs);
 
-    if (!response.ok) {
-      const errorBody = await this.parseErrorResponse(response);
-      throw new ChunkedUploaderError(
-        errorBody.error || `Part upload failed: ${response.statusText}`,
-        response.status,
-        errorBody.code
-      );
+    // Forward external abort signal to our controller
+    const abortListener = () => controller.abort();
+    signal?.addEventListener('abort', abortListener, { once: true });
+
+    try {
+      const response = await this.fetchFn(url, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/octet-stream',
+        },
+        body,
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errorBody = await this.parseErrorResponse(response);
+        throw new ChunkedUploaderError(
+          errorBody.error || `Part upload failed: ${response.statusText}`,
+          response.status,
+          errorBody.code
+        );
+      }
+
+      return response.json();
+    } catch (error) {
+      // Distinguish timeout from user cancellation
+      if (controller.signal.aborted && !signal?.aborted) {
+        throw new ChunkedUploaderError(
+          `Part ${partNumber} upload timed out after ${partTimeoutMs}ms`,
+          408
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', abortListener);
     }
-
-    return response.json();
   }
 
   async getStatus(
