@@ -23,12 +23,43 @@ const DEFAULT_CHUNK_SIZE = 50 * 1024 * 1024;
 const DEFAULT_CONFIG = {
   timeout: 30000,
   concurrency: 3,
-  retryAttempts: 3,
+  retryAttempts: 5,
   retryDelay: 1000,
   finalizePollIntervalMs: 2000,
   finalizeTimeoutMs: 7200000,
   partUploadTimeoutMs: 300000,
+  managementRetryAttempts: 5,
+  managementRetryDelay: 1000,
 } as const;
+
+/** Longest pause between two retries of the same request. */
+const MAX_RETRY_DELAY_MS = 30000;
+
+/** HTTP statuses worth retrying: timeouts, rate limiting and server-side failures. */
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+/**
+ * Whether a failed request may succeed if simply sent again: network errors, our own
+ * timeouts and retryable HTTP statuses. Client errors (4xx) and the caller's own abort
+ * never are.
+ */
+function isRetryableError(error: unknown): boolean {
+  if (error instanceof ChunkedUploaderError) {
+    return error.statusCode !== undefined && isRetryableStatus(error.statusCode);
+  }
+  if (error instanceof Error) {
+    return error.name !== 'AbortError';
+  }
+  return false;
+}
+
+/** Exponential backoff with a little jitter: base, 2x, 4x ... capped at MAX_RETRY_DELAY_MS. */
+function backoffDelay(baseMs: number, attempt: number): number {
+  const delay = Math.min(MAX_RETRY_DELAY_MS, baseMs * 2 ** (attempt - 1));
+  return delay + Math.random() * delay * 0.25;
+}
 
 interface CompleteUploadOptions {
   onProgress?: (event: UploadProgressEvent) => void;
@@ -175,12 +206,21 @@ export class ChunkedUploader {
   }
 
   async cancelUpload(uploadId: string): Promise<CancelUploadResponse> {
-    return this.request<CancelUploadResponse>(
-      'DELETE',
-      `/upload/${uploadId}`,
-      undefined,
-      { useApiKey: true }
-    );
+    try {
+      return await this.request<CancelUploadResponse>(
+        'DELETE',
+        `/upload/${uploadId}`,
+        undefined,
+        { useApiKey: true }
+      );
+    } catch (error) {
+      // Gone already (or a retried DELETE whose first attempt succeeded): the outcome the
+      // caller asked for.
+      if (error instanceof ChunkedUploaderError && error.statusCode === 404) {
+        return { file_id: uploadId, message: 'Upload not found' };
+      }
+      throw error;
+    }
   }
 
   async healthCheck(): Promise<HealthCheckResponse> {
@@ -441,7 +481,19 @@ export class ChunkedUploader {
           }
 
           const chunk = await getChunk(partNumber, chunkSize);
-          const response = await this.uploadPart(uploadId, partNumber, token, chunk, signal);
+          let response: UploadPartResponse | undefined;
+          try {
+            response = await this.uploadPart(uploadId, partNumber, token, chunk, signal);
+          } catch (error) {
+            // 409: the server already has this part (an earlier attempt succeeded but its
+            // response never reached us) or the upload has moved past the parts phase.
+            // Either way there is nothing left to send for it.
+            if (error instanceof ChunkedUploaderError && error.statusCode === 409) {
+              response = undefined;
+            } else {
+              throw error;
+            }
+          }
 
           uploadedParts++;
 
@@ -478,8 +530,16 @@ export class ChunkedUploader {
 
           onPartError?.(partNumber, lastError, attempt);
 
+          // A rejected token or a wrong-sized chunk will not get better by resending it.
+          if (!isRetryableError(lastError)) {
+            break;
+          }
+
           if (attempt < this.config.retryAttempts) {
-            await this.delay(this.config.retryDelay * attempt);
+            await this.delayWithSignal(
+              backoffDelay(this.config.retryDelay, attempt),
+              signal
+            );
           }
         }
       }
@@ -549,10 +609,21 @@ export class ChunkedUploader {
         );
       }
 
-      const status = await this.getStatus(uploadId, {
-        includeParts: false,
-        signal: options.signal,
-      });
+      let status: UploadStatusResponse;
+      try {
+        status = await this.getStatus(uploadId, {
+          includeParts: false,
+          signal: options.signal,
+        });
+      } catch (error) {
+        // The server is still finalizing on its own; a poll that could not reach it is
+        // no reason to give the upload up. Keep polling until finalizeTimeoutMs.
+        if (options.signal?.aborted || !isRetryableError(error)) {
+          throw error;
+        }
+        await this.delayWithSignal(this.config.finalizePollIntervalMs, options.signal);
+        continue;
+      }
 
       const totalParts = options.totalParts ?? status.total_parts;
       const uploadedParts = options.uploadedParts ?? status.uploaded_parts;
@@ -702,7 +773,39 @@ export class ChunkedUploader {
     throw new ChunkedUploaderError('Unsupported file source type');
   }
 
+  /**
+   * Management request (init, status, complete, cancel, health) with retries: network
+   * errors, timeouts, 429 and 5xx are retried with exponential backoff up to
+   * `managementRetryAttempts` times. The caller's abort and 4xx responses are not.
+   */
   private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    options: { useApiKey?: boolean; signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<T> {
+    const attempts = Math.max(1, this.config.managementRetryAttempts);
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        return await this.requestOnce<T>(method, path, body, options);
+      } catch (error) {
+        lastError = error;
+        if (options.signal?.aborted || attempt === attempts || !isRetryableError(error)) {
+          throw error;
+        }
+        await this.delayWithSignal(
+          backoffDelay(this.config.managementRetryDelay, attempt),
+          options.signal
+        );
+      }
+    }
+
+    throw lastError;
+  }
+
+  private async requestOnce<T>(
     method: string,
     path: string,
     body?: unknown,
@@ -745,6 +848,16 @@ export class ChunkedUploader {
       }
 
       return response.json();
+    } catch (error) {
+      // Our own timeout, as opposed to the caller cancelling: report it as a 408 so it is
+      // retried like any other transient failure.
+      if (controller.signal.aborted && !options.signal?.aborted) {
+        throw new ChunkedUploaderError(
+          `${method} ${path} timed out after ${timeoutMs}ms`,
+          408
+        );
+      }
+      throw error;
     } finally {
       clearTimeout(timeoutId);
       options.signal?.removeEventListener('abort', abortListener);

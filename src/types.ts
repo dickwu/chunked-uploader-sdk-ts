@@ -10,9 +10,9 @@ export interface ChunkedUploaderConfig {
   timeout?: number;
   /** Number of concurrent chunk uploads (default: 3) */
   concurrency?: number;
-  /** Retry attempts for failed chunk uploads (default: 3) */
+  /** Retry attempts for failed chunk uploads (default: 5); 4xx other than 408/409/425/429 are not retried */
   retryAttempts?: number;
-  /** Delay between retries in milliseconds (default: 1000) */
+  /** Base delay between chunk retries in milliseconds, doubled each attempt and capped at 30 s (default: 1000) */
   retryDelay?: number;
   /** Poll interval while waiting for finalization (default: 2000) */
   finalizePollIntervalMs?: number;
@@ -20,6 +20,10 @@ export interface ChunkedUploaderConfig {
   finalizeTimeoutMs?: number;
   /** Timeout per individual part upload in milliseconds (default: 300000 = 5 minutes) */
   partUploadTimeoutMs?: number;
+  /** Attempts for management requests (init, status, complete, cancel) on network errors, timeouts, 429 and 5xx (default: 5) */
+  managementRetryAttempts?: number;
+  /** Base delay between management request retries in milliseconds, doubled each attempt and capped at 30 s (default: 1000) */
+  managementRetryDelay?: number;
   /** Custom fetch implementation (for Node.js or custom handling) */
   fetch?: typeof fetch;
 }
@@ -215,7 +219,7 @@ export interface PartUploadResult {
   partNumber: number;
   /** Whether the upload succeeded */
   success: boolean;
-  /** Response data if successful */
+  /** Response data if successful; absent when the server reported the part as already stored (409) */
   response?: UploadPartResponse;
   /** Error if failed */
   error?: Error;

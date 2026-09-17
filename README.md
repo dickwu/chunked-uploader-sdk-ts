@@ -19,6 +19,29 @@ A TypeScript SDK for uploading large files (10GB+) to a chunked upload server. S
 npm install chunked-uploader-sdk
 ```
 
+## v2.1.0: resilient by default
+
+Everything after the parts phase used to be a single attempt: one dropped `POST /complete`
+or `GET /status` request on a flaky connection turned an upload the server had already
+finished into an error. Since 2.1.0:
+
+- Management requests (`initUpload`, `getStatus`, `completeUpload`, `cancelUpload`,
+  `healthCheck`) are retried with exponential backoff on network errors, timeouts, `429`
+  and `5xx` (`managementRetryAttempts`, default 5; `managementRetryDelay`, default 1000 ms,
+  doubled per attempt, capped at 30 s). `4xx` responses and the caller's `AbortSignal` are
+  never retried.
+- While waiting for finalization, a status poll that cannot reach the server is simply
+  retried on the next poll until `finalizeTimeoutMs`; the server keeps finalizing on its own.
+- A `409` on a part upload means the server already has that part (the first attempt
+  succeeded but its response was lost) and is treated as success.
+- Chunk retries: default `retryAttempts` is now 5 with exponential backoff; a chunk rejected
+  with a `4xx` other than `408`/`409`/`425`/`429` fails immediately instead of being resent.
+- The SDK's own request timeout is reported as a `408` `ChunkedUploaderError` and retried;
+  `cancelUpload` treats `404` as already cancelled.
+- Servers that finish finalization inside `POST /complete` (chunked-uploader server
+  `COMPLETE_WAIT_SECS`) are answered with a `200 complete` that the SDK accepts without any
+  polling.
+
 ## v2.0.0 Breaking Changes
 
 - `POST /upload/{id}/complete` is now async (`202` while finalizing, `200` when complete).
@@ -72,10 +95,10 @@ interface ChunkedUploaderConfig {
   /** Number of concurrent chunk uploads (default: 3) */
   concurrency?: number;
 
-  /** Retry attempts for failed chunks (default: 3) */
+  /** Retry attempts for failed chunks (default: 5); 4xx other than 408/409/425/429 are not retried */
   retryAttempts?: number;
 
-  /** Delay between retries in milliseconds (default: 1000) */
+  /** Base delay between chunk retries in milliseconds, doubled each attempt, capped at 30 s (default: 1000) */
   retryDelay?: number;
 
   /** Poll interval while waiting for finalization (default: 2000) */
@@ -83,6 +106,15 @@ interface ChunkedUploaderConfig {
 
   /** Finalization timeout in milliseconds (default: 7200000 / 2h) */
   finalizeTimeoutMs?: number;
+
+  /** Timeout per individual part upload in milliseconds (default: 300000 / 5 min) */
+  partUploadTimeoutMs?: number;
+
+  /** Attempts for management requests on network errors, timeouts, 429 and 5xx (default: 5) */
+  managementRetryAttempts?: number;
+
+  /** Base delay between management retries in milliseconds, doubled each attempt, capped at 30 s (default: 1000) */
+  managementRetryDelay?: number;
 
   /** Custom fetch implementation */
   fetch?: typeof fetch;
@@ -449,6 +481,12 @@ async function manualUpload(file: File) {
 ```
 
 ## Error Handling
+
+Transient failures (network errors, timeouts, `429`, `5xx`) are retried automatically;
+what reaches you is either a permanent error (`4xx`, a rejected token, a file size mismatch),
+the caller's abort, or the last error after all retries. `uploadFile()` and
+`resumeUpload()` report failures after the upload has started through `result.success ===
+false` and `result.error`; `result.fileId` stays available so the upload can be resumed.
 
 The SDK throws `ChunkedUploaderError` for API errors:
 
